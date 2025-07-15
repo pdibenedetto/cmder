@@ -20,7 +20,7 @@ function getSimpleGitBranch() {
   then
     echo " (${headContent:16})"
   else
-  echo " (HEAD detached at ${headContent:0:7})"
+    echo " (HEAD detached at ${headContent:0:7})"
   fi
 }
 
@@ -38,13 +38,13 @@ then
     . ~/.config/git/git-prompt.sh
   fi
 else
-  PS1='\[\033]0;$MSYSTEM:${PWD//[^[:ascii:]]/?}\007\]' # set window title
-  # PS1="$PS1"'\n'                 # new line
-  PS1="$PS1"'\[\033[32m\]'       # change to green
+  # Taken parts from https://github.com/git-for-windows/build-extra/blob/main/git-extra/git-prompt.sh
+  PS1='\[\033]0;${TITLEPREFIX:+$TITLEPREFIX:}${PWD//[^[:ascii:]]/?}\007\]' # set window title to TITLEPREFIX (if set) and current working directory
+  # PS1="$PS1"'\n'               # new line (disabled)
+  PS1="$PS1"'\[\033[32m\]'       # change to green and bold
   PS1="$PS1"'\u@\h '             # user@host<space>
-  # PS1="$PS1"'\[\033[35m\]'       # change to purple
-  # PS1="$PS1"'$MSYSTEM '          # show MSYSTEM
-  PS1="$PS1"'\[\033[33m\]'       # change to brownish yellow
+  PS1="$PS1${MSYSTEM:+\[\033[35m\]$MSYSTEM }" # show MSYSTEM in purple (if set)
+  PS1="$PS1"'\[\033[1;33m\]'     # change to dark yellow in bold
   PS1="$PS1"'\w'                 # current working directory
   if test -z "$WINELOADERNOEXEC"
   then
@@ -66,9 +66,22 @@ else
       fi
     fi
   fi
-  PS1="$PS1"'\[\033[0m\]'        # change color
+  PS1="$PS1"'\[\033[0m\]'        # reset color
   PS1="$PS1"'\n'                 # new line
-  PS1="$PS1"'λ '                 # prompt: always λ
+  PS1="$PS1"'\[\033[30;1m\]'     # change color to grey in bold
+  PS1="$PS1"'λ '                 # prompt: Cmder uses λ
+  PS1="$PS1"'\[\033[0m\]'        # reset color
 fi
 
 MSYS2_PS1="$PS1"               # for detection by MSYS2 SDK's bash.basrc
+
+# Evaluate all user-specific Bash completion scripts (if any)
+if test -z "$WINELOADERNOEXEC"
+then
+  for c in "$HOME"/bash_completion.d/*.bash
+  do
+    # Handle absence of any scripts (or the folder) gracefully
+    test ! -f "$c" ||
+    . "$c"
+  done
+fi
