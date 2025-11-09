@@ -7,13 +7,9 @@
 
 $CMDER_INIT_START = Get-Date
 
-# Compatibility with PS major versions <= 2
+# Determine the script root if not already set
 if (!$PSScriptRoot) {
     $PSScriptRoot = Split-Path $Script:MyInvocation.MyCommand.Path
-}
-
-if ($ENV:CMDER_USER_CONFIG) {
-    Write-Verbose "CMDER IS ALSO USING INDIVIDUAL USER CONFIG FROM '$ENV:CMDER_USER_CONFIG'!"
 }
 
 # We do this for Powershell as Admin Sessions because CMDER_ROOT is not being set.
@@ -31,6 +27,12 @@ $ENV:CMDER_ROOT = ($ENV:CMDER_ROOT).TrimEnd("\")
 # Recent PowerShell versions include PowerShellGet out of the box
 $moduleInstallerAvailable = [bool](Get-Command -Name 'Install-Module' -ErrorAction SilentlyContinue)
 
+# Enable Debug and Verbose output if CMDER_DEBUG environment variable is set to '1' or 'true'
+if ($env:CMDER_DEBUG -and ($env:CMDER_DEBUG -match '^(1|true)$')) {
+    $DebugPreference = 'Continue'
+    $VerbosePreference = 'Continue'
+}
+
 # Add Cmder modules directory to the autoload path.
 $CmderModulePath = Join-path $PSScriptRoot "psmodules/"
 
@@ -43,28 +45,40 @@ if (-not $moduleInstallerAvailable -and -not $env:PSModulePath.Contains($CmderMo
     $env:PSModulePath = $env:PSModulePath.Insert(0, "$CmderModulePath;")
 }
 
+if ($env:CMDER_USER_CONFIG) {
+    Write-Verbose "CMDER IS ALSO USING INDIVIDUAL USER CONFIG FROM '$ENV:CMDER_USER_CONFIG'!"
+}
+
 # Read vendored Git Version
-$gitVersionVendor = (readGitVersion -gitPath "$ENV:CMDER_ROOT\vendor\git-for-windows\cmd")
-Write-Debug "GIT VENDOR: ${gitVersionVendor}"
+$gitVendorPath = Join-Path $ENV:CMDER_ROOT 'vendor\git-for-windows\cmd'
+$gitVersionVendor = Get-GitVersion -GitPath $gitVendorPath
+if (-not [string]::IsNullOrEmpty($gitVersionVendor)) {
+    Write-Debug "GIT VENDOR: ${gitVersionVendor}"
+} else {
+    Write-Debug "GIT VENDOR is not present at '$gitVendorPath'"
+}
 
 # Get user installed Git version(s) if found, and compare them with vendored version.
 foreach ($git in (Get-Command -ErrorAction SilentlyContinue 'git')) {
-    Write-Debug "GIT PATH: {$git.Path}"
+    Write-Debug "GIT USER PATH: $($git.Path)"
     $gitDir = Split-Path -Path $git.Path
-    $gitDir = isGitShim -gitPath $gitDir
-    $gitVersionUser = (readGitVersion -gitPath $gitDir)
-    Write-Debug "GIT USER: ${gitVersionUser}"
+    $gitDir = Get-GitShimPath -GitPath $gitDir
+    $gitVersionUser = Get-GitVersion -GitPath $gitDir
+    Write-Debug "GIT USER VERSION: ${gitVersionUser}"
 
-    $useGitVersion = compare_git_versions -userVersion $gitVersionUser -vendorVersion $gitVersionVendor
+    $useGitVersion = Compare-GitVersion -UserVersion $gitVersionUser -VendorVersion $gitVersionVendor
     Write-Debug "Using Git Version: ${useGitVersion}"
 
     # Use user installed Git
     if ($null -eq $gitPathUser) {
+        Write-Debug "Detected Git from mingw bin directory"
+        Write-Debug "Git Dir: ${gitDir}"
         if ($gitDir -match '\\mingw32\\bin' -or $gitDir -match '\\mingw64\\bin') {
-            $gitPathUser = ($gitDir.subString(0,$gitDir.Length - 12))
+            $gitPathUser = $gitDir.subString(0, $gitDir.Length - 12)
         } else {
-            $gitPathUser = ($gitDir.subString(0,$gitDir.Length - 4))
+            $gitPathUser = $gitDir.subString(0, $gitDir.Length - 4)
         }
+        Write-Debug "Git Path User: ${gitDir}"
     }
 
     if ($useGitVersion -eq $gitVersionUser) {
@@ -85,7 +99,7 @@ Write-Debug "GIT_INSTALL_ROOT: ${ENV:GIT_INSTALL_ROOT}"
 Write-Debug "GIT_INSTALL_TYPE: ${ENV:GIT_INSTALL_TYPE}"
 
 if ($null -ne $ENV:GIT_INSTALL_ROOT) {
-    $env:Path = Configure-Git -gitRoot "$ENV:GIT_INSTALL_ROOT" -gitType $ENV:GIT_INSTALL_TYPE -gitPathUser $gitPathUser
+    $env:Path = Set-GitPath -GitRoot "$ENV:GIT_INSTALL_ROOT" -GitType $ENV:GIT_INSTALL_TYPE -GitPathUser $gitPathUser
 }
 
 # Create 'vi' alias for 'vim' if vim is available
@@ -97,20 +111,19 @@ if (Get-Command -Name "vim" -ErrorAction SilentlyContinue) {
 if (Get-Module PSReadline -ErrorAction "SilentlyContinue") {
     # Display an extra prompt line between the prompt and the command input
     Set-PSReadlineOption -ExtraPromptLineCount 1
-    
-    # Add OSC 133;C support for Windows Terminal shell integration
-    # This marks the start of command output (emitted when Enter is pressed)
+
+    # Invoked when Enter is pressed to submit a command
     if ($env:WT_SESSION) {
         Set-PSReadLineKeyHandler -Key Enter -ScriptBlock {
             # Get the current command line
             $line = $null
             $cursor = $null
             [Microsoft.PowerShell.PSConsoleReadLine]::GetBufferState([ref]$line, [ref]$cursor)
-            
+
             # Accept the line first
             [Microsoft.PowerShell.PSConsoleReadLine]::AcceptLine()
-            
-            # Emit OSC 133;C sequence to mark start of command output
+
+            # Emit OSC 133;C to mark start of command output
             # This is written directly to the console after the command is accepted
             [Console]::Write("$([char]0x1B)]133;C$([char]7)")
         }
@@ -131,7 +144,7 @@ $env:gitLoaded = $null
     $Host.UI.RawUI.ForegroundColor = "White"
     Microsoft.PowerShell.Utility\Write-Host "PS " -NoNewline -ForegroundColor $color
     Microsoft.PowerShell.Utility\Write-Host $pwd.ProviderPath -NoNewLine -ForegroundColor Green
-    checkGit($pwd.ProviderPath)
+    Show-GitStatus -Path $pwd.ProviderPath
     Microsoft.PowerShell.Utility\Write-Host "`nλ" -NoNewLine -ForegroundColor "DarkGray"
 }
 
@@ -220,23 +233,28 @@ if ( $(Get-Command prompt).Definition -match 'PS \$\(\$executionContext.SessionS
     [ScriptBlock]$Prompt = {
         $lastSUCCESS = $?
         $realLastExitCode = $LastExitCode
-        
-        # Emit OSC 9;9 sequence for Windows Terminal directory tracking
-        # This enables "Duplicate Tab" and "Split Pane" to preserve the working directory
-        # Only active in Windows Terminal ($env:WT_SESSION) or ConEmu ($env:ConEmuPID)
-        $loc = $executionContext.SessionState.Path.CurrentLocation
-        if (($env:WT_SESSION -or $env:ConEmuPID) -and $loc.Provider.Name -eq "FileSystem") {
-            Microsoft.PowerShell.Utility\Write-Host -NoNewline "$([char]0x1B)]9;9;`"$($loc.ProviderPath)`"$([char]0x1B)\"
+
+        # Terminal-specific escape sequences for Windows Terminal and ConEmu
+        if ($env:WT_SESSION -or $env:ConEmuPID) {
+            # Emit OSC 133;D to mark the end of command execution with exit code
+            if ($env:WT_SESSION) {
+                Microsoft.PowerShell.Utility\Write-Host -NoNewline "$([char]0x1B)]133;D;$realLastExitCode$([char]7)"
+            }
+
+            # Emit OSC 9;9 to enable directory tracking
+            # Enables "Duplicate Tab" and "Split Pane" to preserve the working directory
+            $loc = $executionContext.SessionState.Path.CurrentLocation
+            if ($loc.Provider.Name -eq "FileSystem") {
+                Microsoft.PowerShell.Utility\Write-Host -NoNewline "$([char]0x1B)]9;9;`"$($loc.ProviderPath)`"$([char]0x1B)\"
+            }
+
+            # Emit OSC 133;A to mark the start of the prompt
+            # Enables features like command navigation, selection, and visual separators
+            if ($env:WT_SESSION) {
+                Microsoft.PowerShell.Utility\Write-Host -NoNewline "$([char]0x1B)]133;A$([char]7)"
+            }
         }
-        
-        # Emit OSC 133;A sequence for Windows Terminal shell integration
-        # This marks the start of the prompt
-        # Enables features like command navigation, selection, and visual separators
-        # Only active in Windows Terminal ($env:WT_SESSION)
-        if ($env:WT_SESSION) {
-            Microsoft.PowerShell.Utility\Write-Host -NoNewline "$([char]0x1B)]133;A$([char]7)"
-        }
-        
+
         $host.UI.RawUI.WindowTitle = Microsoft.PowerShell.Management\Split-Path $pwd.ProviderPath -Leaf
         Microsoft.PowerShell.Utility\Write-Host -NoNewline "$([char]0x200B)`r$([char]0x1B)[K"
         if ($lastSUCCESS -or ($LastExitCode -ne 0)) {
@@ -245,13 +263,12 @@ if ( $(Get-Command prompt).Definition -match 'PS \$\(\$executionContext.SessionS
         PrePrompt | Microsoft.PowerShell.Utility\Write-Host -NoNewline
         CmderPrompt
         PostPrompt | Microsoft.PowerShell.Utility\Write-Host -NoNewline
-        
-        # Emit OSC 133;B sequence for Windows Terminal shell integration
-        # This marks the start of command input (after prompt, before user types)
+
+        # Emit OSC 133;B to mark the start of command input (after prompt, before user types)
         if ($env:WT_SESSION) {
             Microsoft.PowerShell.Utility\Write-Host -NoNewline "$([char]0x1B)]133;B$([char]7)"
         }
-        
+
         $global:LastExitCode = $realLastExitCode
         return " "
     }
