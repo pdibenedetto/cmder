@@ -10,6 +10,10 @@ concurrency:
   group: vendor-update
   cancel-in-progress: false
 
+env:
+  # Fork owners can opt in by setting this Actions repository variable to true.
+  AUTO_MERGE_MINOR_VENDOR_UPDATES: ${{ vars.AUTO_MERGE_MINOR_VENDOR_UPDATES || 'false' }}
+
 defaults:
   run:
     shell: pwsh
@@ -31,6 +35,19 @@ jobs:
     - uses: actions/checkout@v6
       with:
         fetch-depth: 0
+
+    - name: Configure auto-merge policy
+      shell: pwsh
+      run: |
+        $rawValue = [string]$env:AUTO_MERGE_MINOR_VENDOR_UPDATES
+        $normalizedValue = $rawValue.Trim().ToLowerInvariant()
+        $enabled = $normalizedValue -in @('true', '1', 'yes', 'on')
+
+        if ($enabled) {
+          Add-Content -Path $env:GITHUB_ENV -Value "AUTO_MERGE_MINOR_VENDOR_UPDATES_ENABLED=True"
+        } else {
+          Add-Content -Path $env:GITHUB_ENV -Value "AUTO_MERGE_MINOR_VENDOR_UPDATES_ENABLED=False"
+        }
 
     - name: Summary - Workflow started
       shell: pwsh
@@ -168,20 +185,49 @@ jobs:
 
         $summary += $env:UPDATE_MESSAGE + "`n"
 
-        # Check if we can auto-merge (only minor/patch changes)
+        # Check if we can auto-merge (only minor/patch changes, opt-in only).
         $hasBreaking = $env:HAS_BREAKING_CHANGES -eq 'True'
+        $autoMergeEnabled = $env:AUTO_MERGE_MINOR_VENDOR_UPDATES_ENABLED -eq 'True'
         if ($hasBreaking) {
           $summary += '> ⚠️ **Note:** This update contains major version changes that may include breaking changes.'
+        } elseif ($autoMergeEnabled) {
+          $summary += '> ℹ️ **Note:** This update only contains minor or patch changes, and auto-merge is enabled.'
         } else {
-          $summary += '> ℹ️ **Note:** This update only contains minor or patch changes.'
+          $summary += '> ℹ️ **Note:** This update only contains minor or patch changes. Auto-merge is disabled by default; set the `AUTO_MERGE_MINOR_VENDOR_UPDATES` Actions repository variable to `true` to opt in.'
         }
 
         $summary | Add-Content -Path $env:GITHUB_STEP_SUMMARY -Encoding utf8
 
     - name: Auto-merge minor updates
-      if: env.COUNT_UPDATED > 0 && env.HAS_BREAKING_CHANGES != 'True'
+      if: env.COUNT_UPDATED > 0 && env.HAS_BREAKING_CHANGES != 'True' && env.AUTO_MERGE_MINOR_VENDOR_UPDATES_ENABLED == 'True'
       shell: pwsh
       run: |
+        function Get-PushFailureReason {
+          param(
+            [string[]]$PushOutput
+          )
+
+          $text = ($PushOutput -join "`n").Trim()
+
+          if ([string]::IsNullOrWhiteSpace($text)) {
+            return "Git rejected the push to `master`."
+          }
+
+          if ($text -match 'GH006: Protected branch' -or $text -match 'protected branch hook declined') {
+            return "GitHub rejected the push because `master` is protected and direct pushes are blocked."
+          }
+
+          if ($text -match 'non-fast-forward|fetch first|failed to push some refs') {
+            return "The remote branch moved ahead of the local commit, so the push was rejected as non-fast-forward."
+          }
+
+          if ($text -match 'not authorized|permission denied|write access') {
+            return "The workflow token does not have permission to push to `master`."
+          }
+
+          return (($text -split "`r?`n" | Where-Object { $_ -match '^(remote:|! \[remote rejected\]|error:|To )' } | Select-Object -First 4) -join '; ')
+        }
+
         try {
           echo "### 🚀 Auto-merging Updates" >> $env:GITHUB_STEP_SUMMARY
           echo "" >> $env:GITHUB_STEP_SUMMARY
@@ -197,8 +243,19 @@ jobs:
 
           if ($commitSuccess) {
             # Push directly to master
-            git push origin HEAD:master
+            $pushOutput = & git push origin HEAD:master 2>&1
             $pushSuccess = $LASTEXITCODE -eq 0
+            if (-not $pushSuccess) {
+              $pushFailureReason = Get-PushFailureReason -PushOutput @($pushOutput)
+              if (-not [string]::IsNullOrWhiteSpace($pushFailureReason)) {
+                Add-Content -Path $env:GITHUB_ENV -Value "AUTO_MERGE_FAILURE_REASON=$pushFailureReason"
+              }
+              $pushErrorMessage = if ([string]::IsNullOrWhiteSpace($pushFailureReason)) {
+                "Failed to push to master (exit code: $LASTEXITCODE)"
+              } else {
+                "Failed to push to master (exit code: $LASTEXITCODE): $pushFailureReason"
+              }
+            }
 
             if ($pushSuccess) {
               echo "" >> $env:GITHUB_STEP_SUMMARY
@@ -209,7 +266,7 @@ jobs:
               # Set a flag to skip PR creation
               echo "AUTO_MERGED=true" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
             } else {
-              throw "Failed to push to master (exit code: $LASTEXITCODE)"
+              throw $pushErrorMessage
             }
           } else {
             throw "Failed to commit changes (exit code: $LASTEXITCODE)"
@@ -224,24 +281,15 @@ jobs:
 
           Write-Warning "Failed to auto-merge: $($_.Exception.Message)"
 
-          # Only reset if commit was successful but push failed
-          if ($commitSuccess -and -not $pushSuccess) {
-            try {
-              git reset --hard HEAD~1
-              if ($LASTEXITCODE -ne 0) {
-                Write-Warning "Failed to reset commit (exit code: $LASTEXITCODE), continuing with PR creation"
-              }
-            } catch {
-              Write-Warning "Failed to reset commit: $($_.Exception.Message), continuing with PR creation"
-            }
-          }
-
           # Set flag to create PR instead
           echo "AUTO_MERGED=false" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          $global:LASTEXITCODE = 0
+          exit 0
         }
 
-    - uses: peter-evans/create-pull-request@v8
-      if: fromJSON(env.COUNT_UPDATED) > 0 && (env.HAS_BREAKING_CHANGES == 'True' || env.AUTO_MERGED == 'false')
+    - id: create-pr
+      uses: peter-evans/create-pull-request@v8
+      if: fromJSON(env.COUNT_UPDATED) > 0 && env.AUTO_MERGED != 'true'
       with:
         title: ${{ env.COUNT_UPDATED == 1 && format('⬆️ Update {0}', env.LIST_UPDATED) || format('⬆️ Update {0} vendored dependencies', env.COUNT_UPDATED) }}
         body: |
@@ -260,15 +308,19 @@ jobs:
         branch: update-vendor
         base: master
 
-    - name: Summary - Pull request created
-      if: env.COUNT_UPDATED > 0 && (env.HAS_BREAKING_CHANGES == 'True' || env.AUTO_MERGED == 'false')
+    - name: Summary - Pull request result
+      if: env.COUNT_UPDATED > 0 && env.AUTO_MERGED != 'true'
       shell: pwsh
+      env:
+        PR_URL: ${{ steps.create-pr.outputs.pull-request-url }}
+        PR_NUMBER: ${{ steps.create-pr.outputs.pull-request-number }}
+        PR_OPERATION: ${{ steps.create-pr.outputs.pull-request-operation }}
+        AUTO_MERGE_FAILURE_REASON: ${{ env.AUTO_MERGE_FAILURE_REASON }}
+        AUTO_MERGE_MINOR_VENDOR_UPDATES_ENABLED: ${{ env.AUTO_MERGE_MINOR_VENDOR_UPDATES_ENABLED }}
       run: |
         $updateVendorBranchUrl = "$($env:GITHUB_SERVER_URL)/$($env:GITHUB_REPOSITORY)/tree/update-vendor"
         $summary = @"
-        ### 🎉 Pull Request Created
-
-        A pull request has been created to update the vendor dependencies.
+        ### 🎉 Pull Request Result
 
         **Branch:** [``update-vendor``]($updateVendorBranchUrl)
 
@@ -276,15 +328,39 @@ jobs:
 
         "@
 
+        switch ($env:PR_OPERATION) {
+          'created' {
+            $summary += "A new pull request has been created: [#$($env:PR_NUMBER)]($($env:PR_URL))`n`n"
+          }
+          'updated' {
+            $summary += "An existing pull request has been updated: [#$($env:PR_NUMBER)]($($env:PR_URL))`n`n"
+          }
+          'none' {
+            $summary += "No pull request was created because [update-vendor]($updateVendorBranchUrl) no longer differs from ``master``.`n`n"
+          }
+          default {
+            if (-not [string]::IsNullOrWhiteSpace($env:PR_URL)) {
+              $summary += "A pull request was reported, but the operation type was not recognized: [#$($env:PR_NUMBER)]($($env:PR_URL))`n`n"
+            } else {
+              $summary += "A pull request was requested, but no PR link was returned.`n`n"
+            }
+          }
+        }
+
+        if (-not [string]::IsNullOrWhiteSpace($env:AUTO_MERGE_FAILURE_REASON)) {
+          $summary += "> ⚠️ **Auto-merge failure:** $env:AUTO_MERGE_FAILURE_REASON`n`n"
+        }
+
         if ($env:HAS_BREAKING_CHANGES -eq 'True') {
           $summary += "> ⚠️ **Manual review required:** This update contains major version changes."
+        } elseif ($env:PR_OPERATION -eq 'none') {
+          $summary += "> ℹ️ **Note:** No pull request was created because there were no differences left to propose."
+        } elseif ($env:AUTO_MERGE_MINOR_VENDOR_UPDATES_ENABLED -ne 'True') {
+          $summary += "> ℹ️ **Note:** Auto-merge is disabled by configuration. Set the ``AUTO_MERGE_MINOR_VENDOR_UPDATES`` Actions repository variable to ``true`` to opt in."
         } else {
           $summary += "> ℹ️ **Note:** Auto-merge failed, manual review required."
         }
 
-        $summary += @"
-        > Please review and merge the pull request to apply the updates.
-
-        "@
+        $summary += "`n> Please review and merge the pull request to apply the updates.`n`n"
 
         $summary | Add-Content -Path $env:GITHUB_STEP_SUMMARY -Encoding utf8
